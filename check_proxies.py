@@ -1,8 +1,13 @@
 """
 check_proxies.py
 ----------------
-Reads a raw proxy list, tests each one against a real HTTP endpoint,
+Reads a raw proxy list, tests each one against a real HTTPS endpoint,
 and writes only the working proxies to an output file.
+
+Testing over HTTPS (via CONNECT for http/https proxies, and a TLS handshake
+over the SOCKS tunnel) means a proxy only counts as WORKING if it can do what
+your smartlink actually needs. The old plain-HTTP test let proxies that can't
+tunnel HTTPS slip through.
 
 Accepts string or Path arguments throughout, so it can be imported and
 called by other scripts (e.g. loop.py) with plain string paths.
@@ -31,7 +36,7 @@ INPUT_FILE = "free-proxy-list.txt"
 OUTPUT_FILE = "working-proxies.txt"
 TEST_URL_HOST = "api.ipify.org"
 TEST_URL_PATH = "/?format=json"
-TEST_PORT = 80
+TEST_PORT = 443                     # HTTPS — matches the smartlink
 DEFAULT_TIMEOUT = 8.0
 DEFAULT_WORKERS = 64
 BASE_DIR = Path(__file__).resolve().parent
@@ -59,7 +64,8 @@ def load_lines(path) -> list[str]:
     if not path.exists():
         return []
     lines: list[str] = []
-    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+    # utf-8-sig strips a leading BOM if present
+    for line in path.read_text(encoding="utf-8-sig", errors="ignore").splitlines():
         stripped = line.strip()
         if stripped and not stripped.startswith("#"):
             lines.append(stripped)
@@ -107,22 +113,33 @@ def parse_proxy(line: str) -> Optional[ProxyConfig]:
 
 
 # ---------------------------------------------------------------------------
-# LOW-LEVEL HTTP HELPERS
+# LOW-LEVEL HELPERS
 # ---------------------------------------------------------------------------
-def build_http_request(proxy: ProxyConfig, path: str, origin_form: bool,
-                       include_proxy_auth: bool) -> bytes:
-    target = f"http://{TEST_URL_HOST}{path}" if origin_form else path
+def build_connect_request(proxy: ProxyConfig, host: str, port: int) -> bytes:
+    """CONNECT tunnel request sent to an HTTP/HTTPS proxy for an HTTPS target."""
     headers = [
-        f"GET {target} HTTP/1.1",
-        f"Host: {TEST_URL_HOST}",
-        "Connection: close",
+        f"CONNECT {host}:{port} HTTP/1.1",
+        f"Host: {host}:{port}",
+        "Connection: keep-alive",
         "User-Agent: ProxyChecker/1.0",
-        "Accept: */*",
     ]
-    if include_proxy_auth and proxy.username is not None:
+    if proxy.username is not None:
         creds = f"{proxy.username}:{proxy.password or ''}".encode("utf-8")
         headers.append(f"Proxy-Authorization: Basic {base64.b64encode(creds).decode('ascii')}")
     headers += ["", ""]
+    return "\r\n".join(headers).encode("ascii")
+
+
+def build_https_get(host: str, path: str) -> bytes:
+    """Plain GET sent over an established TLS tunnel."""
+    headers = [
+        f"GET {path} HTTP/1.1",
+        f"Host: {host}",
+        "Connection: close",
+        "User-Agent: ProxyChecker/1.0",
+        "Accept: */*",
+        "", "",
+    ]
     return "\r\n".join(headers).encode("ascii")
 
 
@@ -160,6 +177,7 @@ def read_http_status(sock: socket.socket) -> Optional[int]:
 
 
 def connect_socket(proxy: ProxyConfig, timeout: float) -> socket.socket:
+    """TCP connect to the proxy; TLS-wrap if the proxy itself is https://."""
     sock = socket.create_connection((proxy.host, proxy.port), timeout=timeout)
     sock.settimeout(timeout)
     if proxy.scheme == "https":
@@ -169,28 +187,52 @@ def connect_socket(proxy: ProxyConfig, timeout: float) -> socket.socket:
     return sock
 
 
+def tls_wrap(sock: socket.socket, host: str, timeout: float) -> socket.socket:
+    """TLS handshake over an already-established tunnel/socket."""
+    ctx = ssl.create_default_context()
+    tls = ctx.wrap_socket(sock, server_hostname=host)
+    tls.settimeout(timeout)
+    return tls
+
+
 # ---------------------------------------------------------------------------
-# PROTOCOL CHECKS
+# PROTOCOL CHECKS  (all against HTTPS target)
 # ---------------------------------------------------------------------------
 def check_http_proxy(proxy: ProxyConfig, timeout: float) -> bool:
     sock = connect_socket(proxy, timeout)
     try:
-        sock.sendall(build_http_request(proxy, TEST_URL_PATH, True, True))
+        # 1. ask the proxy to open a tunnel to host:443
+        sock.sendall(build_connect_request(proxy, TEST_URL_HOST, TEST_PORT))
         status = read_http_status(sock)
-        return status is not None and 200 <= status < 400
+        if status is None or not (200 <= status < 300):
+            return False
+        # 2. TLS handshake through the tunnel, then a real HTTPS GET
+        tls = tls_wrap(sock, TEST_URL_HOST, timeout)
+        try:
+            tls.sendall(build_https_get(TEST_URL_HOST, TEST_URL_PATH))
+            st = read_http_status(tls)
+            return st is not None and 200 <= st < 400
+        finally:
+            try:
+                tls.close()
+            except Exception:
+                pass
     finally:
-        sock.close()
+        try:
+            sock.close()
+        except Exception:
+            pass
 
 
-def socks4_connect(sock: socket.socket, proxy: ProxyConfig) -> None:
+def socks4_connect(sock: socket.socket, proxy: ProxyConfig, host: str, port: int) -> None:
     try:
-        ip_bytes = socket.inet_aton(TEST_URL_HOST)
+        ip_bytes = socket.inet_aton(host)
         domain = None
     except OSError:
-        ip_bytes, domain = b"\x00\x00\x00\x01", TEST_URL_HOST.encode("idna")
+        ip_bytes, domain = b"\x00\x00\x00\x01", host.encode("idna")
 
     packet = bytearray(b"\x04\x01")
-    packet.extend(struct.pack(">H", TEST_PORT))
+    packet.extend(struct.pack(">H", port))
     packet.extend(ip_bytes)
     packet.extend((proxy.username or "").encode("utf-8"))
     packet.append(0)
@@ -203,7 +245,7 @@ def socks4_connect(sock: socket.socket, proxy: ProxyConfig) -> None:
         raise OSError("SOCKS4 connect rejected")
 
 
-def socks5_connect(sock: socket.socket, proxy: ProxyConfig) -> None:
+def socks5_connect(sock: socket.socket, proxy: ProxyConfig, host: str, port: int) -> None:
     methods = [0x00]
     if proxy.username is not None:
         methods.append(0x02)
@@ -222,11 +264,11 @@ def socks5_connect(sock: socket.socket, proxy: ProxyConfig) -> None:
         if recv_exact(sock, 2)[1] != 0x00:
             raise OSError("SOCKS5 authentication failed")
 
-    host_bytes = TEST_URL_HOST.encode("idna")
+    host_bytes = host.encode("idna")
     req = bytearray(b"\x05\x01\x00\x03")
     req.append(len(host_bytes))
     req.extend(host_bytes)
-    req.extend(struct.pack(">H", TEST_PORT))
+    req.extend(struct.pack(">H", port))
     sock.sendall(bytes(req))
 
     resp = recv_exact(sock, 4)
@@ -247,16 +289,27 @@ def check_socks_proxy(proxy: ProxyConfig, timeout: float) -> bool:
     sock = connect_socket(proxy, timeout)
     try:
         if proxy.scheme == "socks4":
-            socks4_connect(sock, proxy)
+            socks4_connect(sock, proxy, TEST_URL_HOST, TEST_PORT)
         elif proxy.scheme == "socks5":
-            socks5_connect(sock, proxy)
+            socks5_connect(sock, proxy, TEST_URL_HOST, TEST_PORT)
         else:
             raise OSError(f"Unsupported proxy scheme: {proxy.scheme}")
-        sock.sendall(build_http_request(proxy, TEST_URL_PATH, False, False))
-        status = read_http_status(sock)
-        return status is not None and 200 <= status < 400
+        # TLS handshake over the SOCKS tunnel, then a real HTTPS GET
+        tls = tls_wrap(sock, TEST_URL_HOST, timeout)
+        try:
+            tls.sendall(build_https_get(TEST_URL_HOST, TEST_URL_PATH))
+            st = read_http_status(tls)
+            return st is not None and 200 <= st < 400
+        finally:
+            try:
+                tls.close()
+            except Exception:
+                pass
     finally:
-        sock.close()
+        try:
+            sock.close()
+        except Exception:
+            pass
 
 
 def check_proxy(proxy: ProxyConfig, timeout: float) -> tuple[ProxyConfig, bool, str]:
@@ -297,7 +350,7 @@ def run(input_file, output_file, timeout: float, workers: int) -> int:
 
     workers = max(1, min(workers, len(proxies)))
     print(f"Loaded {len(proxies)} proxies from {input_file}")
-    print(f"Checking with {workers} worker(s) and {timeout:.1f}s timeout")
+    print(f"Checking with {workers} worker(s) and {timeout:.1f}s timeout (HTTPS test)")
 
     working: list[str] = []
     checked = 0
@@ -321,7 +374,7 @@ def run(input_file, output_file, timeout: float, workers: int) -> int:
 # CLI
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Check proxies and save the working ones.")
+    p = argparse.ArgumentParser(description="Check proxies (HTTPS) and save the working ones.")
     p.add_argument("-i", "--input", default=INPUT_FILE)
     p.add_argument("-o", "--output", default=OUTPUT_FILE)
     p.add_argument("-t", "--timeout", type=float, default=DEFAULT_TIMEOUT)

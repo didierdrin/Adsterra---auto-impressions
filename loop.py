@@ -2,52 +2,44 @@
 loop.py
 -------
 Opens N tabs per cycle through random working proxies, dwells, clicks, closes.
-
-Anti-fingerprint measures included:
-  - WebRTC leak patched (forces WebRTC through the proxy)
-  - Canvas fingerprint noise (per-context unique)
-  - Coherent locale + timezone identity per tab
-  - Proxy de-duplication within a batch (no same-IP collisions)
-
-Reads proxies from working-proxies.txt (the checker's output) and re-validates
-it before each cycle so expired proxies drop out automatically.
+Reports how many tabs ACTUALLY loaded, how fast, and why the rest failed.
+Sanitizes URLs (BOM / zero-width chars) so goto() never gets an invalid string.
 
 Usage:
     python loop.py
 """
 
 import random
+import re
 import time
 
 from playwright.sync_api import sync_playwright
 
-# Reuse the exact same parser the checker uses (single source of truth).
 from check_proxies import load_lines, parse_proxy, run as run_proxy_check
 
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-BATCH_SIZE   = 100     # tabs per cycle (each on its own proxy)
-DWELL        = 20      # seconds each tab stays open
-CLICK        = True    # click the ad after dwell
-CYCLES       = 0       # 0 = run forever
-PAUSE        = 10      # seconds between cycles
-LOAD_TIMEOUT = 30000   # ms
+BATCH_SIZE   = 100
+DWELL        = 20
+CLICK        = True
+CYCLES       = 0          # 0 = run forever
+PAUSE        = 10
+LOAD_TIMEOUT = 30000      # ms
 HEADLESS     = True
 
 URL_FILE       = "urls.txt"
-PROXY_FILE     = "working-proxies.txt"   # <- checker output, loop input
-RAW_PROXY_FILE = "free-proxy-list.txt"   # used only when REFRESH_MODE == "full"
+PROXY_FILE     = "working-proxies.txt"
+RAW_PROXY_FILE = "free-proxy-list.txt"
 
 # Proxy hygiene
-RECHECK_EVERY = 1          # re-validate proxies every N cycles (0 = never)
-REFRESH_MODE  = "recheck"  # "recheck" = re-test working list; "full" = re-scan raw list
+RECHECK_EVERY = 1         # re-validate proxies every N cycles (0 = never)
+REFRESH_MODE  = "recheck" # "recheck" = re-test working list; "full" = re-scan raw list
 CHECK_TIMEOUT = 8.0
 CHECK_WORKERS = 64
 
 # ---------------------------------------------------------------------------
-# IDENTITIES — coherent locale + timezone pairs (so a tab looks like one user,
-# not a random mix). Swap in proxy-country-matched values if you have geo data.
+# IDENTITIES
 # ---------------------------------------------------------------------------
 PROFILES = [
     ("en-US", "America/New_York"),
@@ -55,21 +47,16 @@ PROFILES = [
     ("en-US", "America/Los_Angeles"),
     ("en-US", "America/Phoenix"),
     ("en-GB", "Europe/London"),
-    ("en-US", "America/New_York"),
-    ("en-US", "America/Los_Angeles"),
 ]
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
 ]
 
-VIEWPORTS = [(1366, 768), (1440, 900), (1536, 864), (1920, 1080), (1280, 720), (1600, 900)]
+VIEWPORTS = [(1366, 768), (1440, 900), (1536, 864), (1920, 1080), (1280, 720)]
 
 STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -80,7 +67,6 @@ Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
 Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
 """
 
-# Canvas noise — each context gets its own seed so the fingerprint differs.
 CANVAS_JS = """
 (() => {
   const seed = %d;
@@ -96,10 +82,29 @@ CANVAS_JS = """
 """
 
 # ---------------------------------------------------------------------------
+# URL SANITIZING
+# BOM, zero-width, non-breaking space, bidi marks, etc.
+# ---------------------------------------------------------------------------
+_INVISIBLE = dict.fromkeys(map(ord, "\ufeff\u200b\u200c\u200d\u00a0\u200e\u200f"))
+
+
+def clean_url(u: str) -> str:
+    """Strip invisible chars/whitespace and ensure a scheme. Returns '' if unusable."""
+    u = u.translate(_INVISIBLE).strip()
+    if not u:
+        return ""
+    if not u.startswith(("http://", "https://")):
+        u = "https://" + u
+    return u
+
+
+_URL_RE = re.compile(r"^https?://[^\s/$.?#].[^\s]*$")
+
+
+# ---------------------------------------------------------------------------
 # PROXY HANDLING
 # ---------------------------------------------------------------------------
 def load_proxies() -> list[dict]:
-    """Load working proxies and convert to Playwright proxy dicts."""
     out = []
     for line in load_lines(PROXY_FILE):
         cfg = parse_proxy(line)
@@ -114,10 +119,9 @@ def load_proxies() -> list[dict]:
 
 
 def refresh_proxies() -> None:
-    """Re-validate the proxy list so expired ones drop out before the cycle."""
     if REFRESH_MODE == "full":
         run_proxy_check(RAW_PROXY_FILE, PROXY_FILE, CHECK_TIMEOUT, CHECK_WORKERS)
-    else:  # recheck the current working list in place
+    else:
         run_proxy_check(PROXY_FILE, PROXY_FILE, CHECK_TIMEOUT, CHECK_WORKERS)
 
 
@@ -132,7 +136,6 @@ def click_ad(page) -> None:
                 anchors = fr.query_selector_all("a[href^='http']")
             except Exception:
                 continue
-            # Prefer anchors that open a new tab or point off-domain.
             for el in anchors:
                 try:
                     target = el.get_attribute("target") or ""
@@ -142,7 +145,6 @@ def click_ad(page) -> None:
                         return
                 except Exception:
                     pass
-            # Otherwise click the first one.
             if anchors:
                 try:
                     anchors[0].click(timeout=2000)
@@ -151,14 +153,13 @@ def click_ad(page) -> None:
                     pass
     except Exception:
         pass
-    # Last resort: click mid-page.
     try:
         page.mouse.click(400, 400)
     except Exception:
         pass
 
 
-def build_context(browser, proxy: dict | None):
+def build_context(browser, proxy):
     """Create one hardened context with a coherent identity."""
     w, h = random.choice(VIEWPORTS)
     locale, timezone = random.choice(PROFILES)
@@ -169,33 +170,54 @@ def build_context(browser, proxy: dict | None):
         locale=locale,
         timezone_id=timezone,
         color_scheme="light",
-        device_scale_factor=random.choice([1, 1, 2]),
     )
     ctx.add_init_script(STEALTH_JS)
     ctx.add_init_script(CANVAS_JS % random.randint(0, 255))
     return ctx
 
 
-def run_cycle(browser, urls: list[str], proxies: list[dict]) -> None:
+def run_cycle(browser, urls, proxies):
+    """Returns (loaded, avg_load_s, fail_counts, samples)."""
     contexts, pages = [], []
 
     # De-dupe proxies within the batch so no IP is reused in one cycle.
     if proxies:
         pool = random.sample(proxies, min(BATCH_SIZE, len(proxies)))
-        # If batch > pool size, top up with extra random picks.
         while len(pool) < BATCH_SIZE:
             pool.append(random.choice(proxies))
     else:
         pool = [None] * BATCH_SIZE
 
+    loaded = 0
+    total_load_time = 0.0
+    fails: dict[str, int] = {}
+    samples: list[str] = []
+
     for i in range(BATCH_SIZE):
         proxy = pool[i] if i < len(pool) else (random.choice(proxies) if proxies else None)
         ctx = build_context(browser, proxy)
         pg = ctx.new_page()
+        url = random.choice(urls)
+
+        t1 = time.time()
         try:
-            pg.goto(random.choice(urls), wait_until="domcontentloaded", timeout=LOAD_TIMEOUT)
-        except Exception:
-            pass
+            resp = pg.goto(url, wait_until="domcontentloaded", timeout=LOAD_TIMEOUT)
+            total_load_time += time.time() - t1
+            status = resp.status if resp else 0
+            if status and status < 400:
+                loaded += 1
+                if len(samples) < 3:
+                    samples.append(f"{status} {pg.url[:70]}")
+            else:
+                key = f"http {status}"
+                fails[key] = fails.get(key, 0) + 1
+        except Exception as e:
+            total_load_time += time.time() - t1
+            msg = str(e)
+            m = re.search(r"net::ERR_[A-Z_]+", msg)
+            key = m.group(0) if m else f"{type(e).__name__}: {msg.splitlines()[0][:60]}"
+            fails[key] = fails.get(key, 0) + 1
+
         contexts.append(ctx)
         pages.append(pg)
 
@@ -209,26 +231,40 @@ def run_cycle(browser, urls: list[str], proxies: list[dict]) -> None:
         except Exception:
             pass
 
+    avg = total_load_time / BATCH_SIZE if BATCH_SIZE else 0
+    return loaded, avg, fails, samples
+
 
 # ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
 def main() -> None:
-    urls = load_lines(URL_FILE)
-    if not urls:
+    raw_urls = load_lines(URL_FILE)
+    if not raw_urls:
         print("No URLs in urls.txt")
         return
 
-    print(f"Loaded {len(urls)} url(s)")
+    # Sanitize + validate every URL before it ever reaches goto().
+    cleaned = [clean_url(u) for u in raw_urls]
+    urls = [u for u in cleaned if u and _URL_RE.match(u)]
+
+    for original, final in zip(raw_urls, cleaned):
+        flag = "" if final and _URL_RE.match(final) else "  <-- DROPPED"
+        print(f"URL: {repr(final)}{flag}")
+
+    if not urls:
+        print("No valid URLs after sanitizing - check urls.txt for hidden characters")
+        return
+    print(f"Loaded {len(urls)} valid url(s)")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=HEADLESS,
+            channel="chromium",              # full Chromium + new headless
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
-                # Force WebRTC through the proxy so the real host IP doesn't leak.
                 "--webrtc-ip-handling-policy=disable_non_proxied_udp",
                 "--disable-features=IsolateOrigins,site-per-process",
             ],
@@ -237,7 +273,6 @@ def main() -> None:
         cycle = 0
         while True:
             cycle += 1
-            t0 = time.time()
 
             if RECHECK_EVERY and cycle % RECHECK_EVERY == 0:
                 print(f"[cycle {cycle}] re-validating proxies...")
@@ -247,10 +282,18 @@ def main() -> None:
             if not proxies:
                 print("No working proxies available - running direct")
             else:
-                print(f"[cycle {cycle}] using {len(proxies)} working proxies")
+                print(f"[cycle {cycle}] using {len(proxies)} proxies")
 
-            run_cycle(browser, urls, proxies)
-            print(f"cycle {cycle} done in {time.time() - t0:.0f}s")
+            t0 = time.time()
+            loaded, avg, fails, samples = run_cycle(browser, urls, proxies)
+            elapsed = time.time() - t0
+
+            print(f"cycle {cycle} done in {elapsed:.0f}s - {loaded}/{BATCH_SIZE} loaded, avg load {avg:.2f}s")
+            if fails:
+                top = sorted(fails.items(), key=lambda x: -x[1])[:5]
+                print("   fails:", ", ".join(f"{k}={v}" for k, v in top))
+            for s in samples:
+                print("   sample:", s)
 
             if CYCLES and cycle >= CYCLES:
                 break
