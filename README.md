@@ -4,3 +4,8 @@
 • FlashProxy Resources: Supplies around 2,000 working daily proxies with API access formats in TXT, CSV, and JSON.
 • IPRoyal Free Proxy List: Features residential SOCKS5 and HTTPS server IPs suited for bypassing basic blocks or testing.
 • GitHub Free Proxy Repositories: Open-source developer repositories like iplocate/free-proxy-list and zloi-user/hideip.me offer automated, frequently refreshed proxy lists in code-friendly formats.
+
+
+
+
+fetch + update the file free-proxies using the check-proxies.py file, also make multiple smartlinks so that the earning will be scaled up.
