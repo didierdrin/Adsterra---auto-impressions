@@ -2,6 +2,9 @@
 loop.py
 -------
 Opens N tabs per cycle through random working proxies, dwells, clicks, closes.
+ASYNC version: tabs load concurrently via a bounded worker pool instead of one
+at a time, and each context is closed as soon as its task finishes (no 100
+live contexts held in RAM).
 Reports how many tabs ACTUALLY loaded, how fast, and why the rest failed.
 Sanitizes URLs (BOM / zero-width chars) so goto() never gets an invalid string.
 
@@ -9,11 +12,12 @@ Usage:
     python loop.py
 """
 
+import asyncio
 import random
 import re
 import time
 
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 
 from check_proxies import load_lines, parse_proxy, run as run_proxy_check
 
@@ -21,6 +25,7 @@ from check_proxies import load_lines, parse_proxy, run as run_proxy_check
 # CONFIG
 # ---------------------------------------------------------------------------
 BATCH_SIZE   = 100
+MAX_WORKERS  = 25         # <-- concurrent tabs. Tune to your RAM/CPU (start 20-30)
 DWELL        = 20
 CLICK        = True
 CYCLES       = 0          # 0 = run forever
@@ -33,10 +38,10 @@ PROXY_FILE     = "working-proxies.txt"
 RAW_PROXY_FILE = "free-proxy-list.txt"
 
 # Proxy hygiene
-RECHECK_EVERY = 1         # re-validate proxies every N cycles (0 = never)
+RECHECK_EVERY = 5         # re-validate proxies every N cycles (0 = never)
 REFRESH_MODE  = "recheck" # "recheck" = re-test working list; "full" = re-scan raw list
 CHECK_TIMEOUT = 8.0
-CHECK_WORKERS = 64
+CHECK_WORKERS = 16        # keep modest on small boxes
 
 # ---------------------------------------------------------------------------
 # IDENTITIES
@@ -126,44 +131,44 @@ def refresh_proxies() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ACTIONS
+# ACTIONS (async)
 # ---------------------------------------------------------------------------
-def click_ad(page) -> None:
+async def click_ad(page) -> None:
     """Prefer an off-domain / new-tab anchor (likely the ad), else fall back."""
     try:
         for fr in page.frames:
             try:
-                anchors = fr.query_selector_all("a[href^='http']")
+                anchors = await fr.query_selector_all("a[href^='http']")
             except Exception:
                 continue
             for el in anchors:
                 try:
-                    target = el.get_attribute("target") or ""
-                    href = el.get_attribute("href") or ""
+                    target = await el.get_attribute("target") or ""
+                    href = await el.get_attribute("href") or ""
                     if target == "_blank" or "adsterra" in href or "auctionr" in href:
-                        el.click(timeout=2000)
+                        await el.click(timeout=2000)
                         return
                 except Exception:
                     pass
             if anchors:
                 try:
-                    anchors[0].click(timeout=2000)
+                    await anchors[0].click(timeout=2000)
                     return
                 except Exception:
                     pass
     except Exception:
         pass
     try:
-        page.mouse.click(400, 400)
+        await page.mouse.click(400, 400)
     except Exception:
         pass
 
 
-def build_context(browser, proxy):
+async def build_context(browser, proxy):
     """Create one hardened context with a coherent identity."""
     w, h = random.choice(VIEWPORTS)
     locale, timezone = random.choice(PROFILES)
-    ctx = browser.new_context(
+    ctx = await browser.new_context(
         proxy=proxy,
         user_agent=random.choice(USER_AGENTS),
         viewport={"width": w, "height": h},
@@ -171,14 +176,61 @@ def build_context(browser, proxy):
         timezone_id=timezone,
         color_scheme="light",
     )
-    ctx.add_init_script(STEALTH_JS)
-    ctx.add_init_script(CANVAS_JS % random.randint(0, 255))
+    await ctx.add_init_script(STEALTH_JS)
+    await ctx.add_init_script(CANVAS_JS % random.randint(0, 255))
     return ctx
 
 
-def run_cycle(browser, urls, proxies):
+async def run_tab(browser, proxy, urls, sem, results) -> None:
+    """One tab: open through `proxy`, dwell, click, close. Bounded by `sem`."""
+    async with sem:
+        ctx = None
+        url = random.choice(urls)
+        t1 = time.time()
+        try:
+            ctx = await build_context(browser, proxy)
+            pg = await ctx.new_page()
+
+            #resp = await pg.goto(url, wait_until="domcontentloaded", timeout=LOAD_TIMEOUT)
+            resp = await pg.goto(url, wait_until="commit", timeout=LOAD_TIMEOUT)
+            results["total_load_time"] += time.time() - t1
+
+            status = resp.status if resp else 0
+            if status and status < 400:
+                results["loaded"] += 1
+                if len(results["samples"]) < 3:
+                    results["samples"].append(f"{status} {pg.url[:70]}")
+            else:
+                key = f"http {status}"
+                results["fails"][key] = results["fails"].get(key, 0) + 1
+
+            await asyncio.sleep(DWELL)
+            if CLICK:
+                await click_ad(pg)
+
+        except Exception as e:
+            results["total_load_time"] += time.time() - t1
+            msg = str(e)
+            m = re.search(r"net::ERR_[A-Z_]+", msg)
+            key = m.group(0) if m else f"{type(e).__name__}: {msg.splitlines()[0][:60]}"
+            results["fails"][key] = results["fails"].get(key, 0) + 1
+
+        finally:
+            if ctx is not None:
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
+
+
+async def run_cycle(browser, urls, proxies):
     """Returns (loaded, avg_load_s, fail_counts, samples)."""
-    contexts, pages = [], []
+    results = {
+        "loaded": 0,
+        "total_load_time": 0.0,
+        "fails": {},
+        "samples": [],
+    }
 
     # De-dupe proxies within the batch so no IP is reused in one cycle.
     if proxies:
@@ -188,58 +240,21 @@ def run_cycle(browser, urls, proxies):
     else:
         pool = [None] * BATCH_SIZE
 
-    loaded = 0
-    total_load_time = 0.0
-    fails: dict[str, int] = {}
-    samples: list[str] = []
+    sem = asyncio.Semaphore(MAX_WORKERS)
+    tasks = [
+        asyncio.create_task(run_tab(browser, pool[i], urls, sem, results))
+        for i in range(BATCH_SIZE)
+    ]
+    await asyncio.gather(*tasks)
 
-    for i in range(BATCH_SIZE):
-        proxy = pool[i] if i < len(pool) else (random.choice(proxies) if proxies else None)
-        ctx = build_context(browser, proxy)
-        pg = ctx.new_page()
-        url = random.choice(urls)
-
-        t1 = time.time()
-        try:
-            #resp = pg.goto(url, wait_until="domcontentloaded", timeout=LOAD_TIMEOUT)
-            resp = pg.goto(url, wait_until="commit", timeout=LOAD_TIMEOUT)
-            total_load_time += time.time() - t1
-            status = resp.status if resp else 0
-            if status and status < 400:
-                loaded += 1
-                if len(samples) < 3:
-                    samples.append(f"{status} {pg.url[:70]}")
-            else:
-                key = f"http {status}"
-                fails[key] = fails.get(key, 0) + 1
-        except Exception as e:
-            total_load_time += time.time() - t1
-            msg = str(e)
-            m = re.search(r"net::ERR_[A-Z_]+", msg)
-            key = m.group(0) if m else f"{type(e).__name__}: {msg.splitlines()[0][:60]}"
-            fails[key] = fails.get(key, 0) + 1
-
-        contexts.append(ctx)
-        pages.append(pg)
-
-    time.sleep(DWELL)
-    if CLICK:
-        for pg in pages:
-            click_ad(pg)
-    for ctx in contexts:
-        try:
-            ctx.close()
-        except Exception:
-            pass
-
-    avg = total_load_time / BATCH_SIZE if BATCH_SIZE else 0
-    return loaded, avg, fails, samples
+    avg = results["total_load_time"] / BATCH_SIZE if BATCH_SIZE else 0
+    return results["loaded"], avg, results["fails"], results["samples"]
 
 
 # ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
-def main() -> None:
+async def main() -> None:
     raw_urls = load_lines(URL_FILE)
     if not raw_urls:
         print("No URLs in urls.txt")
@@ -258,8 +273,8 @@ def main() -> None:
         return
     print(f"Loaded {len(urls)} valid url(s)")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
             headless=HEADLESS,
             channel="chromium",              # full Chromium + new headless
             args=[
@@ -272,36 +287,39 @@ def main() -> None:
         )
 
         cycle = 0
-        while True:
-            cycle += 1
+        try:
+            while True:
+                cycle += 1
 
-            if RECHECK_EVERY and cycle % RECHECK_EVERY == 0:
-                print(f"[cycle {cycle}] re-validating proxies...")
-                refresh_proxies()
+                if RECHECK_EVERY and cycle % RECHECK_EVERY == 0:
+                    print(f"[cycle {cycle}] re-validating proxies...")
+                    # blocking check -> run off the event loop
+                    await asyncio.to_thread(refresh_proxies)
 
-            proxies = load_proxies()
-            if not proxies:
-                print("No working proxies available - running direct")
-            else:
-                print(f"[cycle {cycle}] using {len(proxies)} proxies")
+                proxies = await asyncio.to_thread(load_proxies)
+                if not proxies:
+                    print("No working proxies available - running direct")
+                else:
+                    print(f"[cycle {cycle}] using {len(proxies)} proxies")
 
-            t0 = time.time()
-            loaded, avg, fails, samples = run_cycle(browser, urls, proxies)
-            elapsed = time.time() - t0
+                t0 = time.time()
+                loaded, avg, fails, samples = await run_cycle(browser, urls, proxies)
+                elapsed = time.time() - t0
 
-            print(f"cycle {cycle} done in {elapsed:.0f}s - {loaded}/{BATCH_SIZE} loaded, avg load {avg:.2f}s")
-            if fails:
-                top = sorted(fails.items(), key=lambda x: -x[1])[:5]
-                print("   fails:", ", ".join(f"{k}={v}" for k, v in top))
-            for s in samples:
-                print("   sample:", s)
+                print(f"cycle {cycle} done in {elapsed:.0f}s - "
+                      f"{loaded}/{BATCH_SIZE} loaded, avg load {avg:.2f}s")
+                if fails:
+                    top = sorted(fails.items(), key=lambda x: -x[1])[:5]
+                    print("   fails:", ", ".join(f"{k}={v}" for k, v in top))
+                for s in samples:
+                    print("   sample:", s)
 
-            if CYCLES and cycle >= CYCLES:
-                break
-            time.sleep(PAUSE)
-
-        browser.close()
+                if CYCLES and cycle >= CYCLES:
+                    break
+                await asyncio.sleep(PAUSE)
+        finally:
+            await browser.close()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
