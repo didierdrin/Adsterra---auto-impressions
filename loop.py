@@ -25,7 +25,7 @@ DWELL        = 20
 CLICK        = True
 CYCLES       = 0          # 0 = run forever
 PAUSE        = 10
-LOAD_TIMEOUT = 30000      # ms
+LOAD_TIMEOUT = 10000      # ms
 HEADLESS     = True
 
 URL_FILE       = "urls.txt"
@@ -201,7 +201,8 @@ def run_cycle(browser, urls, proxies):
 
         t1 = time.time()
         try:
-            resp = pg.goto(url, wait_until="domcontentloaded", timeout=LOAD_TIMEOUT)
+            #resp = pg.goto(url, wait_until="domcontentloaded", timeout=LOAD_TIMEOUT)
+            resp = pg.goto(url, wait_until="commit", timeout=LOAD_TIMEOUT)
             total_load_time += time.time() - t1
             status = resp.status if resp else 0
             if status and status < 400:
