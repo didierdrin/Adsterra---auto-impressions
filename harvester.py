@@ -16,7 +16,7 @@ import httpx
 # CONFIGURATION
 # ---------------------------------------------------------------------------
 PROXY_FILE = "free-proxy-list.txt"  # Saved where check_proxies.py expects it
-TARGET_WORKING_COUNT = 150          # Stop testing early once we find this many
+TARGET_WORKING_COUNT = 400          # Stop testing early once we find this many
 FETCH_INTERVAL = 300                # Time in seconds between fetch cycles
 TEST_URL_HOST = "api.ipify.org"
 TEST_URL_PATH = "/?format=json"

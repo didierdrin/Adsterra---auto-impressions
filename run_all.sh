@@ -109,6 +109,8 @@ info "Testing proxies via check_proxies.py..."
     -t "$CHECK_TIMEOUT" \
     -w "$CHECK_WORKERS"
 
+"$PY" geo_resolve.py
+
 WORKING_COUNT=$(grep -cve '^\s*$' "$WORKING_FILE" || true)
 if [[ "$WORKING_COUNT" -eq 0 ]]; then
     warn "No working proxies found in initial batch, but background harvester is running to fetch more."

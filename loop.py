@@ -1,58 +1,109 @@
 """
 loop.py
 -------
-Opens N tabs per cycle through random working proxies, dwells, clicks, closes.
+Opens N tabs per cycle through random working proxies, dwells, and closes.
 ASYNC version: tabs load concurrently via a bounded worker pool instead of one
-at a time, and each context is closed as soon as its task finishes (no 100
-live contexts held in RAM).
-Reports how many tabs ACTUALLY loaded, how fast, and why the rest failed.
-Sanitizes URLs (BOM / zero-width chars) so goto() never gets an invalid string.
+at a time, and each context is closed as soon as its task finishes.
+
+Popunder / Direct-Link mode: CLICK is disabled since earnings are 100% 
+impression-driven (CPM). Focuses on clean page loads, residential proxies,
+and geo-matched browser identities.
 
 Usage:
     python loop.py
 """
 
 import asyncio
+import json
 import random
 import re
 import time
+from pathlib import Path
 
 from playwright.async_api import async_playwright
 
 from check_proxies import load_lines, parse_proxy, run as run_proxy_check
 
 # ---------------------------------------------------------------------------
-# CONFIG
+# CONFIG (Popunder / Impression-focused)
 # ---------------------------------------------------------------------------
 BATCH_SIZE   = 100
-MAX_WORKERS  = 25         # <-- concurrent tabs. Tune to your RAM/CPU (start 20-30)
+MAX_WORKERS  = 25
 DWELL        = 20
-CLICK        = True
-CYCLES       = 0          # 0 = run forever
+CLICK        = False    # Disabled: Popunders pay per impression, clicks are unnecessary
+CYCLES       = 0
 PAUSE        = 10
-LOAD_TIMEOUT = 10000      # ms
+LOAD_TIMEOUT = 10000
 HEADLESS     = True
 
 URL_FILE       = "urls.txt"
 PROXY_FILE     = "working-proxies.txt"
 RAW_PROXY_FILE = "free-proxy-list.txt"
+GEO_FILE       = "proxy-geo.json"     # written by geo_resolve.py
 
 # Proxy hygiene
-RECHECK_EVERY = 5         # re-validate proxies every N cycles (0 = never)
-REFRESH_MODE  = "recheck" # "recheck" = re-test working list; "full" = re-scan raw list
+RECHECK_EVERY = 5
+REFRESH_MODE  = "recheck"
 CHECK_TIMEOUT = 8.0
-CHECK_WORKERS = 16        # keep modest on small boxes
+CHECK_WORKERS = 16
 
 # ---------------------------------------------------------------------------
-# IDENTITIES
+# IDENTITIES  (country -> coherent locale + timezone)
 # ---------------------------------------------------------------------------
-PROFILES = [
-    ("en-US", "America/New_York"),
-    ("en-US", "America/Chicago"),
-    ("en-US", "America/Los_Angeles"),
-    ("en-US", "America/Phoenix"),
-    ("en-GB", "Europe/London"),
-]
+COUNTRY_PROFILES = {
+    "US": ("en-US", "America/New_York"),
+    "CA": ("en-CA", "America/Toronto"),
+    "GB": ("en-GB", "Europe/London"),
+    "IE": ("en-IE", "Europe/Dublin"),
+    "AU": ("en-AU", "Australia/Sydney"),
+    "NZ": ("en-NZ", "Pacific/Auckland"),
+    "DE": ("de-DE", "Europe/Berlin"),
+    "FR": ("fr-FR", "Europe/Paris"),
+    "ES": ("es-ES", "Europe/Madrid"),
+    "IT": ("it-IT", "Europe/Rome"),
+    "NL": ("nl-NL", "Europe/Amsterdam"),
+    "PL": ("pl-PL", "Europe/Warsaw"),
+    "SE": ("sv-SE", "Europe/Stockholm"),
+    "NO": ("nb-NO", "Europe/Oslo"),
+    "DK": ("da-DK", "Europe/Copenhagen"),
+    "FI": ("fi-FI", "Europe/Helsinki"),
+    "CH": ("de-CH", "Europe/Zurich"),
+    "AT": ("de-AT", "Europe/Vienna"),
+    "BE": ("nl-BE", "Europe/Brussels"),
+    "PT": ("pt-PT", "Europe/Lisbon"),
+    "RO": ("ro-RO", "Europe/Bucharest"),
+    "CZ": ("cs-CZ", "Europe/Prague"),
+    "HU": ("hu-HU", "Europe/Budapest"),
+    "BG": ("bg-BG", "Europe/Sofia"),
+    "GR": ("el-GR", "Europe/Athens"),
+    "RU": ("ru-RU", "Europe/Moscow"),
+    "UA": ("uk-UA", "Europe/Kyiv"),
+    "TR": ("tr-TR", "Europe/Istanbul"),
+    "BR": ("pt-BR", "America/Sao_Paulo"),
+    "AR": ("es-AR", "America/Argentina/Buenos_Aires"),
+    "CL": ("es-CL", "America/Santiago"),
+    "CO": ("es-CO", "America/Bogota"),
+    "MX": ("es-MX", "America/Mexico_City"),
+    "IN": ("en-IN", "Asia/Kolkata"),
+    "ID": ("id-ID", "Asia/Jakarta"),
+    "VN": ("vi-VN", "Asia/Ho_Chi_Minh"),
+    "TH": ("th-TH", "Asia/Bangkok"),
+    "PH": ("en-PH", "Asia/Manila"),
+    "SG": ("en-SG", "Asia/Singapore"),
+    "MY": ("ms-MY", "Asia/Kuala_Lumpur"),
+    "JP": ("ja-JP", "Asia/Tokyo"),
+    "KR": ("ko-KR", "Asia/Seoul"),
+    "CN": ("zh-CN", "Asia/Shanghai"),
+    "HK": ("zh-HK", "Asia/Hong_Kong"),
+    "TW": ("zh-TW", "Asia/Taipei"),
+    "AE": ("ar-AE", "Asia/Dubai"),
+    "IL": ("he-IL", "Asia/Jerusalem"),
+    "ZA": ("en-ZA", "Africa/Johannesburg"),
+    "NG": ("en-NG", "Africa/Lagos"),
+    "EG": ("ar-EG", "Africa/Cairo"),
+    "KE": ("en-KE", "Africa/Nairobi"),
+}
+FALLBACK_PROFILE = ("en-US", "America/New_York")
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -61,16 +112,13 @@ USER_AGENTS = [
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
 ]
 
-VIEWPORTS = [(1366, 768), (1440, 900), (1536, 864), (1920, 1080), (1280, 720)]
-
-STEALTH_JS = """
-Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-window.chrome = { runtime: {} };
-Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
-Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
-Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
-"""
+DEVICES = [
+    (USER_AGENTS[0], (1920, 1080), 1),
+    (USER_AGENTS[0], (1536, 864), 1),
+    (USER_AGENTS[1], (1440, 900), 2),
+    (USER_AGENTS[2], (1366, 768), 1),
+    (USER_AGENTS[3], (390, 844), 3),
+]
 
 CANVAS_JS = """
 (() => {
@@ -86,15 +134,26 @@ CANVAS_JS = """
 })();
 """
 
+
+def stealth_js(locale: str) -> str:
+    base = locale.split("-")[0]
+    return f"""
+Object.defineProperty(navigator, 'webdriver', {{get: () => undefined}});
+window.chrome = {{ runtime: {{}} }};
+Object.defineProperty(navigator, 'plugins', {{get: () => [1,2,3,4,5]}});
+Object.defineProperty(navigator, 'languages', {{get: () => ['{locale}', '{base}']}});
+Object.defineProperty(navigator, 'hardwareConcurrency', {{get: () => 8}});
+Object.defineProperty(navigator, 'deviceMemory', {{get: () => 8}});
+"""
+
+
 # ---------------------------------------------------------------------------
 # URL SANITIZING
-# BOM, zero-width, non-breaking space, bidi marks, etc.
 # ---------------------------------------------------------------------------
 _INVISIBLE = dict.fromkeys(map(ord, "\ufeff\u200b\u200c\u200d\u00a0\u200e\u200f"))
 
 
 def clean_url(u: str) -> str:
-    """Strip invisible chars/whitespace and ensure a scheme. Returns '' if unusable."""
     u = u.translate(_INVISIBLE).strip()
     if not u:
         return ""
@@ -107,20 +166,52 @@ _URL_RE = re.compile(r"^https?://[^\s/$.?#].[^\s]*$")
 
 
 # ---------------------------------------------------------------------------
-# PROXY HANDLING
+# GEO & PROXY HANDLING (Residential Prioritization)
 # ---------------------------------------------------------------------------
+_GEO: dict[str, dict] = {}
+
+
+def reload_geo() -> None:
+    global _GEO
+    try:
+        _GEO = json.loads(Path(GEO_FILE).read_text(encoding="utf-8"))
+    except Exception:
+        _GEO = {}
+
+
+def profile_for(proxy) -> tuple[str, str]:
+    if proxy:
+        info = _GEO.get(proxy["server"], {})
+        cc = info.get("country") if isinstance(info, dict) else info
+        if cc and cc in COUNTRY_PROFILES:
+            return COUNTRY_PROFILES[cc]
+    return FALLBACK_PROFILE
+
+
 def load_proxies() -> list[dict]:
-    out = []
+    residential = []
+    datacenter = []
+    
     for line in load_lines(PROXY_FILE):
         cfg = parse_proxy(line)
         if not cfg:
             continue
-        proxy = {"server": f"{cfg.scheme}://{cfg.host}:{cfg.port}"}
+        proxy_str = f"{cfg.scheme}://{cfg.host}:{cfg.port}"
+        proxy = {"server": proxy_str}
         if cfg.username:
             proxy["username"] = cfg.username
             proxy["password"] = cfg.password or ""
-        out.append(proxy)
-    return out
+            
+        info = _GEO.get(proxy_str, {})
+        is_dc = info.get("is_datacenter", True) if isinstance(info, dict) else True
+        
+        if not is_dc:
+            residential.append(proxy)
+        else:
+            datacenter.append(proxy)
+            
+    print(f"[*] Proxy Pool Sorted: {len(residential)} residential-like, {len(datacenter)} datacenter")
+    return residential + datacenter
 
 
 def refresh_proxies() -> None:
@@ -131,58 +222,26 @@ def refresh_proxies() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ACTIONS (async)
+# ACTIONS (Async Impression Handling)
 # ---------------------------------------------------------------------------
-async def click_ad(page) -> None:
-    """Prefer an off-domain / new-tab anchor (likely the ad), else fall back."""
-    try:
-        for fr in page.frames:
-            try:
-                anchors = await fr.query_selector_all("a[href^='http']")
-            except Exception:
-                continue
-            for el in anchors:
-                try:
-                    target = await el.get_attribute("target") or ""
-                    href = await el.get_attribute("href") or ""
-                    if target == "_blank" or "adsterra" in href or "auctionr" in href:
-                        await el.click(timeout=2000)
-                        return
-                except Exception:
-                    pass
-            if anchors:
-                try:
-                    await anchors[0].click(timeout=2000)
-                    return
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    try:
-        await page.mouse.click(400, 400)
-    except Exception:
-        pass
-
-
 async def build_context(browser, proxy):
-    """Create one hardened context with a coherent identity."""
-    w, h = random.choice(VIEWPORTS)
-    locale, timezone = random.choice(PROFILES)
+    ua, (w, h), dsf = random.choice(DEVICES)
+    locale, timezone = profile_for(proxy)
     ctx = await browser.new_context(
         proxy=proxy,
-        user_agent=random.choice(USER_AGENTS),
+        user_agent=ua,
         viewport={"width": w, "height": h},
+        device_scale_factor=dsf,
         locale=locale,
         timezone_id=timezone,
         color_scheme="light",
     )
-    await ctx.add_init_script(STEALTH_JS)
+    await ctx.add_init_script(stealth_js(locale))
     await ctx.add_init_script(CANVAS_JS % random.randint(0, 255))
     return ctx
 
 
 async def run_tab(browser, proxy, urls, sem, results) -> None:
-    """One tab: open through `proxy`, dwell, click, close. Bounded by `sem`."""
     async with sem:
         ctx = None
         url = random.choice(urls)
@@ -191,8 +250,7 @@ async def run_tab(browser, proxy, urls, sem, results) -> None:
             ctx = await build_context(browser, proxy)
             pg = await ctx.new_page()
 
-            #resp = await pg.goto(url, wait_until="domcontentloaded", timeout=LOAD_TIMEOUT)
-            resp = await pg.goto(url, wait_until="commit", timeout=LOAD_TIMEOUT)
+            resp = await pg.goto(url, wait_until="domcontentloaded", timeout=LOAD_TIMEOUT)
             results["total_load_time"] += time.time() - t1
 
             status = resp.status if resp else 0
@@ -201,12 +259,11 @@ async def run_tab(browser, proxy, urls, sem, results) -> None:
                 if len(results["samples"]) < 3:
                     results["samples"].append(f"{status} {pg.url[:70]}")
             else:
-                key = f"http {status}"
+                key = f"http {status or 'no-response'}"
                 results["fails"][key] = results["fails"].get(key, 0) + 1
 
-            await asyncio.sleep(DWELL)
-            if CLICK:
-                await click_ad(pg)
+            # Jittered dwell time to ensure impression registers fully
+            await asyncio.sleep(random.uniform(DWELL * 0.6, DWELL * 1.6))
 
         except Exception as e:
             results["total_load_time"] += time.time() - t1
@@ -224,15 +281,8 @@ async def run_tab(browser, proxy, urls, sem, results) -> None:
 
 
 async def run_cycle(browser, urls, proxies):
-    """Returns (loaded, avg_load_s, fail_counts, samples)."""
-    results = {
-        "loaded": 0,
-        "total_load_time": 0.0,
-        "fails": {},
-        "samples": [],
-    }
+    results = {"loaded": 0, "total_load_time": 0.0, "fails": {}, "samples": []}
 
-    # De-dupe proxies within the batch so no IP is reused in one cycle.
     if proxies:
         pool = random.sample(proxies, min(BATCH_SIZE, len(proxies)))
         while len(pool) < BATCH_SIZE:
@@ -260,7 +310,6 @@ async def main() -> None:
         print("No URLs in urls.txt")
         return
 
-    # Sanitize + validate every URL before it ever reaches goto().
     cleaned = [clean_url(u) for u in raw_urls]
     urls = [u for u in cleaned if u and _URL_RE.match(u)]
 
@@ -273,10 +322,13 @@ async def main() -> None:
         return
     print(f"Loaded {len(urls)} valid url(s)")
 
+    reload_geo()
+    print(f"Loaded geo map for {len(_GEO)} proxies")
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=HEADLESS,
-            channel="chromium",              # full Chromium + new headless
+            channel="chromium",
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
@@ -293,8 +345,8 @@ async def main() -> None:
 
                 if RECHECK_EVERY and cycle % RECHECK_EVERY == 0:
                     print(f"[cycle {cycle}] re-validating proxies...")
-                    # blocking check -> run off the event loop
                     await asyncio.to_thread(refresh_proxies)
+                    reload_geo()
 
                 proxies = await asyncio.to_thread(load_proxies)
                 if not proxies:
@@ -310,9 +362,9 @@ async def main() -> None:
                       f"{loaded}/{BATCH_SIZE} loaded, avg load {avg:.2f}s")
                 if fails:
                     top = sorted(fails.items(), key=lambda x: -x[1])[:5]
-                    print("   fails:", ", ".join(f"{k}={v}" for k, v in top))
+                    print("  fails:", ", ".join(f"{k}={v}" for k, v in top))
                 for s in samples:
-                    print("   sample:", s)
+                    print("  sample:", s)
 
                 if CYCLES and cycle >= CYCLES:
                     break
