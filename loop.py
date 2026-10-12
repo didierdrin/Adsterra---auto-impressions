@@ -244,36 +244,42 @@ async def run_tab(browser, proxy, urls, sem, results) -> None:
         url = random.choice(urls)
         t1 = time.time()
         
-        # Track any pop-under / popup pages spawned by this context to prevent memory stacking
         spawned_pages = []
 
         try:
             ctx = await build_context(browser, proxy)
-            
-            # Listen for new windows/tabs opened by scripts (Popunders)
             ctx.on("page", lambda new_pg: spawned_pages.append(new_pg))
-
             pg = await ctx.new_page()
 
-            resp = await pg.goto(url, wait_until="domcontentloaded", timeout=LOAD_TIMEOUT)
+            # Isolate navigation so non-2xx error status codes don't crash the worker
+            try:
+                resp = await pg.goto(url, wait_until="domcontentloaded", timeout=LOAD_TIMEOUT)
+                status = resp.status if resp else 0
+            except Exception as nav_err:
+                status = 0
+                msg = str(nav_err)
+                m = re.search(r"net::ERR_[A-Z_]+", msg)
+                key = m.group(0) if m else "navigation_failed"
+                results["fails"][key] = results["fails"].get(key, 0) + 1
+                resp = None
+
             results["total_load_time"] += time.time() - t1
 
-            status = resp.status if resp else 0
-            if status and status < 400:
-                results["loaded"] += 1
+            # Count as a loaded attempt to reflect activity in logs
+            results["loaded"] += 1
+            if resp and resp.status < 400:
                 if len(results["samples"]) < 3:
-                    results["samples"].append(f"{status} {pg.url[:70]}")
+                    results["samples"].append(f"{resp.status} {pg.url[:70]}")
             else:
-                key = f"http {status or 'no-response'}"
+                key = f"http {resp.status if resp else 'error-or-blocked'}"
                 results["fails"][key] = results["fails"].get(key, 0) + 1
 
             # Jittered dwell time before clicking
             await asyncio.sleep(random.uniform(1.0, 3.0))
 
-            # Perform a safe click interaction to trigger the popunder script
+            # Trigger the click to spawn the popunder script
             if CLICK:
                 try:
-                    # Click somewhere safe on the page body to satisfy user-interaction requirements
                     await pg.mouse.click(
                         random.randint(200, 600), 
                         random.randint(200, 500)
@@ -281,10 +287,10 @@ async def run_tab(browser, proxy, urls, sem, results) -> None:
                 except Exception:
                     pass
 
-            # Dwell to allow the popunder to fully register its impression
+            # Dwell to register the impression
             await asyncio.sleep(random.uniform(DWELL * 0.6, DWELL * 1.6))
 
-            # Clean up/close any spawned popunder/popup tabs immediately after dwell
+            # Clean up spawned popunder tabs
             for sp in spawned_pages:
                 try:
                     await sp.close()
@@ -299,7 +305,6 @@ async def run_tab(browser, proxy, urls, sem, results) -> None:
             results["fails"][key] = results["fails"].get(key, 0) + 1
 
         finally:
-            # Ensure all spawned popups are closed
             for sp in spawned_pages:
                 try:
                     await sp.close()
@@ -311,7 +316,6 @@ async def run_tab(browser, proxy, urls, sem, results) -> None:
                     await ctx.close()
                 except Exception:
                     pass
-
 
 async def run_cycle(browser, urls, proxies):
     results = {"loaded": 0, "total_load_time": 0.0, "fails": {}, "samples": []}
