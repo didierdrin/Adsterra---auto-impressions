@@ -1,13 +1,9 @@
 """
 loop.py
 -------
-Opens N tabs per cycle through random working proxies, dwells, and closes.
-ASYNC version: tabs load concurrently via a bounded worker pool instead of one
-at a time, and each context is closed as soon as its task finishes.
-
-Popunder / Direct-Link mode: CLICK is disabled since earnings are 100% 
-impression-driven (CPM). Focuses on clean page loads, residential proxies,
-and geo-matched browser identities.
+Opens N tabs per cycle through random working proxies, loads the target,
+triggers a safe click to spawn the popunder, cleans up spawned popup tabs
+to prevent memory leaks, dwells, and closes.
 
 Usage:
     python loop.py
@@ -25,15 +21,15 @@ from playwright.async_api import async_playwright
 from check_proxies import load_lines, parse_proxy, run as run_proxy_check
 
 # ---------------------------------------------------------------------------
-# CONFIG (Popunder / Impression-focused)
+# CONFIG (Popunder Automation & Click Trigger)
 # ---------------------------------------------------------------------------
 BATCH_SIZE   = 100
 MAX_WORKERS  = 25
 DWELL        = 20
-CLICK        = False    # Disabled: Popunders pay per impression, clicks are unnecessary
+CLICK        = True     # Enabled: Popunder networks require an interaction/click to spawn
 CYCLES       = 0
 PAUSE        = 10
-LOAD_TIMEOUT = 10000
+LOAD_TIMEOUT = 25000    # Increased to accommodate slow free proxies
 HEADLESS     = True
 
 URL_FILE       = "urls.txt"
@@ -43,7 +39,7 @@ GEO_FILE       = "proxy-geo.json"     # written by geo_resolve.py
 
 # Proxy hygiene
 RECHECK_EVERY = 5
-REFRESH_MODE  = "recheck"
+REFRESH_MODE  = "full"
 CHECK_TIMEOUT = 8.0
 CHECK_WORKERS = 16
 
@@ -166,7 +162,7 @@ _URL_RE = re.compile(r"^https?://[^\s/$.?#].[^\s]*$")
 
 
 # ---------------------------------------------------------------------------
-# GEO & PROXY HANDLING (Residential Prioritization)
+# GEO & PROXY HANDLING
 # ---------------------------------------------------------------------------
 _GEO: dict[str, dict] = {}
 
@@ -222,7 +218,7 @@ def refresh_proxies() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ACTIONS (Async Impression Handling)
+# ACTIONS (Async Tab & Popunder Management)
 # ---------------------------------------------------------------------------
 async def build_context(browser, proxy):
     ua, (w, h), dsf = random.choice(DEVICES)
@@ -235,6 +231,7 @@ async def build_context(browser, proxy):
         locale=locale,
         timezone_id=timezone,
         color_scheme="light",
+        ignore_https_errors=True,  # Bypass proxy SSL cert issues
     )
     await ctx.add_init_script(stealth_js(locale))
     await ctx.add_init_script(CANVAS_JS % random.randint(0, 255))
@@ -246,8 +243,16 @@ async def run_tab(browser, proxy, urls, sem, results) -> None:
         ctx = None
         url = random.choice(urls)
         t1 = time.time()
+        
+        # Track any pop-under / popup pages spawned by this context to prevent memory stacking
+        spawned_pages = []
+
         try:
             ctx = await build_context(browser, proxy)
+            
+            # Listen for new windows/tabs opened by scripts (Popunders)
+            ctx.on("page", lambda new_pg: spawned_pages.append(new_pg))
+
             pg = await ctx.new_page()
 
             resp = await pg.goto(url, wait_until="domcontentloaded", timeout=LOAD_TIMEOUT)
@@ -262,8 +267,29 @@ async def run_tab(browser, proxy, urls, sem, results) -> None:
                 key = f"http {status or 'no-response'}"
                 results["fails"][key] = results["fails"].get(key, 0) + 1
 
-            # Jittered dwell time to ensure impression registers fully
+            # Jittered dwell time before clicking
+            await asyncio.sleep(random.uniform(1.0, 3.0))
+
+            # Perform a safe click interaction to trigger the popunder script
+            if CLICK:
+                try:
+                    # Click somewhere safe on the page body to satisfy user-interaction requirements
+                    await pg.mouse.click(
+                        random.randint(200, 600), 
+                        random.randint(200, 500)
+                    )
+                except Exception:
+                    pass
+
+            # Dwell to allow the popunder to fully register its impression
             await asyncio.sleep(random.uniform(DWELL * 0.6, DWELL * 1.6))
+
+            # Clean up/close any spawned popunder/popup tabs immediately after dwell
+            for sp in spawned_pages:
+                try:
+                    await sp.close()
+                except Exception:
+                    pass
 
         except Exception as e:
             results["total_load_time"] += time.time() - t1
@@ -273,6 +299,13 @@ async def run_tab(browser, proxy, urls, sem, results) -> None:
             results["fails"][key] = results["fails"].get(key, 0) + 1
 
         finally:
+            # Ensure all spawned popups are closed
+            for sp in spawned_pages:
+                try:
+                    await sp.close()
+                except Exception:
+                    pass
+
             if ctx is not None:
                 try:
                     await ctx.close()
