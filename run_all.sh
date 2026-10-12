@@ -57,6 +57,12 @@ if ! "$PY" -c "import playwright" >/dev/null 2>&1; then
     pip install playwright
 fi
 
+# Ensure httpx is installed for harvester.py
+if ! "$PY" -c "import httpx" >/dev/null 2>&1; then
+    info "Installing httpx..."
+    pip install httpx
+fi
+
 if ! "$PY" -c "from playwright.sync_api import sync_playwright; sync_playwright" >/dev/null 2>&1; then
     fail "playwright import failed"
 fi
